@@ -37,6 +37,8 @@ public:
 
 	bool set(const char* mainKey, const char* subKey, const char* subValue);
 
+	void setDouble(const char* mainKey, const char* subKey, double value);
+
 	bool remove(const char* mainKey, const char* subKey = NULL);
 
 	void enableFastMode();
@@ -352,6 +354,13 @@ inline bool ZIni::set(const char* mainKey, const char* subKey, const char* subVa
 		return true;
 	}
 	return writeIntoFile();
+}
+
+inline void ZIni::setDouble(const char* mainKey, const char* subKey, double value)
+{
+	char buf[64];
+	sprintf_s(buf, "%.4f", value);
+	set(mainKey, subKey, buf);
 }
 
 inline bool ZIni::remove(const char* mainKey, const char* subKey)

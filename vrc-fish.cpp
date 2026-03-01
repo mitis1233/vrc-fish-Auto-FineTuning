@@ -84,6 +84,8 @@ struct g_config {
 	double bb_boundary_zone;
 	double bb_boundary_weight;
 	int bb_log_interval_ms;
+	int adaptive_mcp_enabled;
+	double adaptive_mcp_learning_rate;
 	int ml_mode;
 	string ml_record_csv;
 	string ml_weights_file;
@@ -181,6 +183,9 @@ void loadConfig() {
 	config.bb_boundary_zone = ini.getDouble("vrchat_fish", "bb_boundary_zone", 40.0);
 	config.bb_boundary_weight = ini.getDouble("vrchat_fish", "bb_boundary_weight", 0.3);
 	config.bb_log_interval_ms = ini.getInt("vrchat_fish", "bb_log_interval_ms", 200);
+
+	config.adaptive_mcp_enabled = ini.getInt("vrchat_fish", "adaptive_mcp_enabled", 1);
+	config.adaptive_mcp_learning_rate = ini.getDouble("vrchat_fish", "adaptive_mcp_learning_rate", 0.01);
 
 	config.ml_mode = ini.getInt("vrchat_fish", "ml_mode", 0);
 	config.ml_record_csv = ini.get("vrchat_fish", "ml_record_csv", "record_data.csv");
@@ -654,6 +659,27 @@ static void mouseLeftUp() {
 	sendMouseLeftRaw(MOUSEEVENTF_LEFTUP, "leftup");
 }
 
+static void shakeMouse() {
+	activateGameWindow();
+	INPUT input = {};
+	input.type = INPUT_MOUSE;
+	input.mi.dwFlags = MOUSEEVENTF_MOVE;
+
+	// 向右移動 5 像素
+	input.mi.dx = 5;
+	input.mi.dy = 0;
+	SendInput(1, &input, sizeof(INPUT));
+	
+	Sleep(10); // 短暫延遲確保系統識別兩次移動
+
+	// 向左移動 5 像素 (回到原點)
+	input.mi.dx = -5;
+	input.mi.dy = 0;
+	SendInput(1, &input, sizeof(INPUT));
+
+	std::cout << "[vrchat_fish] 檢測到多次超時，執行滑鼠抖動以防卡住" << std::endl;
+}
+
 static void mouseLeftClickCentered(int delayMs = 40) {
 	activateGameWindowInner(true);
 	sendMouseLeftRaw(MOUSEEVENTF_LEFTDOWN, "leftdown");
@@ -1081,12 +1107,15 @@ void fishVrchat() {
 	double lastDtRatio = 1.0;      // 实际dt / 基准dt，用于MPC缩放
 	double baseDtMs = config.base_dt_ms;
 	if (baseDtMs < 1.0) baseDtMs = 1.0;
+	bool adaptiveParamsDirty = false; // 自我学习参数是否需要落盘（减少 SSD 写入）
+	double lastAdaptiveErrForUi = 0.0;
 	int lastGoodSliderH = 0;       // 上次可信的滑块高度（用于 sH 异常时兜底）
 	int lastGoodSliderCY = 0;      // 上次可信的滑块中心Y（用于 [tpl] 跳变检查）
 	bool hasLastGoodPos = false;   // 是否有上次可信位置
 	int consecutiveMiss = 0;       // 连续 MISS 帧数（用于 MISS 期间松开鼠标）
 	Rect fixedTrackRoi{};          // 首帧定位的固定轨道 ROI（整局不变）
 	bool hasFixedTrack = false;    // 是否已定位轨道
+	double difficultyEMA = 0.0;    // 鱼的难度估计 (基于鱼的速度绝对值)
 
 	// 快速检测缓存：首帧多尺度确定最佳缩放和模板，后续帧复用
 	double cachedFishScale = 1.0;
@@ -1269,6 +1298,7 @@ void fishVrchat() {
 		Mat gray;
 		cvtColor(frame, gray, COLOR_BGR2GRAY);
 
+		static int biteTimeoutCount = 0;
 		if (state == VrFishState::WaitBite) {
 			TplMatch m{};
 			bool ok = detectBite(gray, &m);
@@ -1277,16 +1307,20 @@ void fishVrchat() {
 			}
 			biteOkFrames = ok ? (biteOkFrames + 1) : 0;
 			if (biteOkFrames >= config.bite_confirm_frames) {
-				saveDebugFrame(frame, "bite", m.rect);
+				biteOkFrames = 0;
+				biteTimeoutCount = 0; // 成功触发咬钩，重置计数
 				mouseLeftClickCentered();
-				hasPrevSlider = false;
-				hasFixedTrack = false;
 				switchState(VrFishState::EnterMinigame);
 				continue;
 			}
 			if (nowMs() - stateStart > (unsigned long long)config.bite_timeout_ms) {
+				biteTimeoutCount++;
 				if (config.vr_debug) {
-					std::cout << "[vrchat_fish] bite timeout -> recast" << endl;
+					std::cout << "[vrchat_fish] bite timeout (" << biteTimeoutCount << ") -> recast" << endl;
+				}
+				if (biteTimeoutCount >= 3) {
+					shakeMouse();
+					biteTimeoutCount = 0; // 执行抖动后重置
 				}
 				saveDebugFrame(frame, "bite_timeout");
 				cleanupToNextRound("bite_timeout");
@@ -1675,11 +1709,13 @@ void fishVrchat() {
 								// 滑块太短，按中心距离算代价
 								cost += abs(fY - sCY);
 							} else if (fY < sTop) {
-								cost += (sTop - fY);
+								cost += (sTop - fY) * 1.5; // 增加偏離上邊界的權重
 							} else if (fY > sBot) {
 								cost += (fY - sBot);
 							}
 							// 在安全区内 → cost += 0
+							// 額外代價：鼓勵魚靠近中心而非邊緣
+							cost += abs(fY - sCY) * 0.1;
 						}
 
 						// 边界减速惩罚：滑块以较高速度接近轨道边界时施加额外代价
@@ -1717,6 +1753,64 @@ void fishVrchat() {
 						holding = false;
 					}
 
+						// ── 自我學習算法：根據魚的位置誤差微調 MPC 物理參數 ──
+						// 重要：小遊戲結束前後會出現連續 MISS（魚/滑塊 UI 消失或變形）
+						// 這些 MISS 不應計入學習，否則會用舊 det 數據反覆更新參數。
+						if (config.adaptive_mcp_enabled && ok) {
+							// 更新難度估計：使用魚的速度絕對值作為特徵
+							double curFishVelAbs = std::abs(smoothFishVel);
+							difficultyEMA = difficultyEMA * 0.95 + curFishVelAbs * 0.05;
+
+							double error = (double)det.fishY - (double)det.sliderCenterY;
+							double lr = config.adaptive_mcp_learning_rate;
+
+							// 根據難度動態調整學習率：困難魚 (速度快) 需要更謹慎的更新
+							// 簡單魚難度值約 1~3，困難魚約 5~15+
+							double difficultyScale = 1.0 / (1.0 + difficultyEMA * 0.2);
+							double adaptedLr = lr * difficultyScale;
+
+							int sliderHForLearn = det.sliderHeight;
+							if (sliderHForLearn < 1) sliderHForLearn = 1;
+							// 归一化误差：用滑块高度做尺度，避免不同鱼/不同UI尺寸下学习过激
+							double errN = error / (double)sliderHForLearn;
+							// 死区：誤差很小時不學習
+							if (std::abs(errN) < 0.02) {
+								errN = 0.0;
+							}
+							
+							bool changed = false;
+							if (errN != 0.0) {
+								// 目标：让鱼趋向滑块中心。
+								double step = adaptedLr * errN;
+								config.bb_gravity -= step * 0.5;
+								config.bb_thrust  -= step * 0.5;
+								changed = true;
+							}
+						
+						if (changed) {
+							config.bb_thrust = std::clamp(config.bb_thrust, -10.0, -0.5);
+							config.bb_gravity = std::clamp(config.bb_gravity, 0.5, 10.0);
+							adaptiveParamsDirty = true;
+							lastAdaptiveErrForUi = error;
+
+							// 顯示自我學習更新的數值（節流輸出，避免刷屏）
+							static unsigned long long lastAdaptiveLogMs = 0;
+							unsigned long long logNow = nowMs();
+							if (config.vr_debug || vrLogFile.is_open()) {
+								if (logNow - lastAdaptiveLogMs > 500) {
+									std::ostringstream aoss;
+									aoss << "[ADAPT] err=" << (int)error
+										<< " lr=" << config.adaptive_mcp_learning_rate
+										<< " g=" << config.bb_gravity
+										<< " t=" << config.bb_thrust;
+									writeVrLogLine(aoss.str(), config.vr_debug);
+									lastAdaptiveLogMs = logNow;
+								}
+							}
+							
+						}
+					}
+
 					if (config.vr_debug || vrLogFile.is_open()) {
 						int logIntervalMs = config.bb_log_interval_ms;
 						if (logIntervalMs < 0) logIntervalMs = 0;
@@ -1749,6 +1843,22 @@ void fishVrchat() {
 
 		if (state == VrFishState::PostMinigame) {
 			saveDebugFrame(frame, "post_minigame");
+			// 回合结束：将自我学习得到的参数写回 config.ini（减少运行中频繁写入）
+			if (adaptiveParamsDirty) {
+				ZIni ini("config.ini");
+				ini.setDouble("vrchat_fish", "bb_thrust", config.bb_thrust);
+				ini.setDouble("vrchat_fish", "bb_gravity", config.bb_gravity);
+				adaptiveParamsDirty = false;
+			}
+			// 在 state/cleanup 日志附近输出一次本回合学习到的最终参数
+			if (config.vr_debug || vrLogFile.is_open()) {
+				std::ostringstream aoss;
+				aoss << "[ADAPT] err=" << (int)lastAdaptiveErrForUi
+					<< " lr=" << config.adaptive_mcp_learning_rate
+					<< " g=" << config.bb_gravity
+					<< " t=" << config.bb_thrust;
+				writeVrLogLine(aoss.str(), config.vr_debug);
+			}
 			// 录制模式：flush CSV
 			if (config.ml_mode == 1 && recordFile.is_open()) {
 				recordFile.flush();
@@ -1788,5 +1898,13 @@ int main() {
 	else {
 		fishVrchat();
 	}
+
+	// 程式退出前最後一次持久化自我學習參數
+	// 註：這需要 fishVrchat 正常返回。如果用戶直接關閉窗口，建議使用 atexit 或 SetConsoleCtrlHandler
+	ZIni ini("config.ini");
+	ini.setDouble("vrchat_fish", "bb_thrust", config.bb_thrust);
+	ini.setDouble("vrchat_fish", "bb_gravity", config.bb_gravity);
+	std::cout << "[ADAPT] 程式退出，參數已保存至 config.ini" << std::endl;
+
 	return 0;
 }
